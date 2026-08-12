@@ -640,3 +640,35 @@ if(NOT NO_EXAMPLES)
 	add_subdirectory(examples/copy-paste-capi)
 endif()
 
+# mywebrtc: ABI-isolated C API + C++ wrapper + business layer
+file(GLOB MYWEBRTC_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/mywebrtc/*.cpp")
+file(GLOB MYWEBRTC_HEADERS "${CMAKE_CURRENT_SOURCE_DIR}/include/mywebrtc/*.*")
+add_library(mywebrtc SHARED ${MYWEBRTC_SOURCES} ${MYWEBRTC_HEADERS})
+target_compile_definitions(mywebrtc PRIVATE MYRTC_EXPORTS)
+set_target_properties(mywebrtc PROPERTIES
+    VERSION ${PROJECT_VERSION}
+    SOVERSION ${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}
+    CXX_STANDARD 17
+    CXX_VISIBILITY_PRESET default)
+target_include_directories(mywebrtc
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include/mywebrtc
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/mywebrtc
+        ${CMAKE_CURRENT_SOURCE_DIR}/deps/json/include)
+target_link_libraries(mywebrtc PUBLIC datachannel Threads::Threads)
+if(WIN32)
+    target_link_libraries(mywebrtc PUBLIC ws2_32)
+    target_link_options(mywebrtc PRIVATE -Wl,--export-all-symbols)
+endif()
+add_library(MyWebRTC::MyWebRTC ALIAS mywebrtc)
+install(TARGETS mywebrtc RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/mywebrtc/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mywebrtc)
+
+if(NOT NO_WEBSOCKET)
+	add_subdirectory(examples/my-client)
+endif()
