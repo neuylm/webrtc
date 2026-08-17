@@ -51,19 +51,41 @@ bool splitEndpoint(const std::string& text, std::string& host, uint16_t& port) {
 
 void announce(const std::shared_ptr<mywebrtc::SignalingChannel>& signaling,
               const std::string& localId, const std::string& remoteId,
-              const std::string& endpoint) {
-    mywebrtc::SignalingMessage msg;
-    msg.peer_id = localId;
-    msg.type = "rtm";
-    msg.candidate = endpoint;
-    signaling->send(remoteId, msg);
+              const std::vector<std::string>& endpoints) {
+    for (const auto& endpoint : endpoints) {
+        mywebrtc::SignalingMessage msg;
+        msg.peer_id = localId;
+        msg.type = "rtm";
+        msg.candidate = endpoint;
+        signaling->send(remoteId, msg);
+    }
+}
+
+std::vector<std::string> gather(const std::shared_ptr<myrtm::Endpoint>& rtm,
+                                const std::string& stunAddr) {
+    std::vector<std::string> out;
+    out.push_back("127.0.0.1:" + std::to_string(rtm->localPort()));
+
+    if (stunAddr.empty())
+        return out;
+
+    if (!rtm->gatherPublicAddress(2000)) {
+        say("rtm stun lookup failed against " + stunAddr);
+        return out;
+    }
+
+    std::string seen = rtm->publicAddress();
+    say("rtm public address is " + seen + " per " + stunAddr);
+    if (!seen.empty() && seen != out.front())
+        out.push_back(seen);
+    return out;
 }
 
 }
 
 int main(int argc, char* argv[]) {
     if (argc < 4) {
-        std::cout << "usage: rtm-session <host|viewer> <localId> <remoteId> [wsUrl] [key]"
+        std::cout << "usage: rtm-session <host|viewer> <localId> <remoteId> [wsUrl] [key] [stun]"
                   << std::endl;
         return 1;
     }
@@ -73,6 +95,7 @@ int main(int argc, char* argv[]) {
     std::string remoteId = argv[3];
     std::string wsUrl = argc > 4 ? argv[4] : "ws://127.0.0.1:8000";
     std::string key = argc > 5 ? argv[5] : "rtm-session-key";
+    std::string stunAddr = argc > 6 ? argv[6] : "";
 
     bool isHost = role == "host";
     if (!isHost && role != "viewer") {
@@ -86,6 +109,8 @@ int main(int argc, char* argv[]) {
     auto signaling = std::make_shared<mywebrtc::WebSocketSignalingChannel>();
     auto auth = std::make_shared<mywebrtc::DefaultAuthPolicy>(key);
     auto sm = std::make_shared<mywebrtc::SessionManager>(auth, signaling);
+    if (!stunAddr.empty())
+        sm->setIceServers({"stun:" + stunAddr});
 
     if (!sm->init(wsUrl, localId, key)) {
         std::cerr << "signaling connect failed" << std::endl;
@@ -95,10 +120,12 @@ int main(int argc, char* argv[]) {
 
     myrtm::Config cfg;
     cfg.psk = key;
+    if (!stunAddr.empty())
+        cfg.stunServers.push_back(stunAddr);
 
     std::mutex rtmMtx;
     std::shared_ptr<myrtm::Endpoint> rtm;
-    std::string localCandidate;
+    std::vector<std::string> localCandidates;
 
     if (isHost) {
         rtm = myrtm::Endpoint::listen(cfg);
@@ -106,7 +133,7 @@ int main(int argc, char* argv[]) {
             std::cerr << "rtm listen failed" << std::endl;
             return 1;
         }
-        localCandidate = "127.0.0.1:" + std::to_string(rtm->localPort());
+        localCandidates = gather(rtm, stunAddr);
         rtm->onPeer([](myrtm::Endpoint::PeerId id, myrtm::PeerEvent e) {
             say("rtm peer " + std::to_string(id) + (e == myrtm::PeerEvent::Connected
                                                         ? " connected"
@@ -114,7 +141,7 @@ int main(int argc, char* argv[]) {
         });
         rtm->onInput([](myrtm::Endpoint::PeerId, const myrtm::InputEvent&) { g_inputs++; });
         rtm->onAudio([](myrtm::Endpoint::PeerId, const myrtm::AudioFrame&) { g_frames++; });
-        say("rtm listening on " + localCandidate);
+        say("rtm listening on " + localCandidates.front());
     }
 
     std::vector<mywebrtc::Subscription> subs;
@@ -133,9 +160,9 @@ int main(int argc, char* argv[]) {
             rtm = myrtm::Endpoint::connect(cfg, peerHost, peerPort);
             if (!rtm)
                 return;
-            localCandidate = "127.0.0.1:" + std::to_string(rtm->localPort());
-            say("rtm dialing " + *msg.candidate + " from " + localCandidate);
-            announce(signaling, localId, remoteId, localCandidate);
+            localCandidates = gather(rtm, stunAddr);
+            say("rtm dialing " + *msg.candidate + " from " + localCandidates.front());
+            announce(signaling, localId, remoteId, localCandidates);
             return;
         }
         rtm->addRemoteCandidate(*msg.candidate);
@@ -169,7 +196,7 @@ int main(int argc, char* argv[]) {
     }
 
     if (isHost)
-        announce(signaling, localId, remoteId, localCandidate);
+        announce(signaling, localId, remoteId, localCandidates);
 
     std::vector<uint8_t> opus(80, 0x3c);
     uint32_t rtpTs = 0;
@@ -214,7 +241,7 @@ int main(int argc, char* argv[]) {
 
         if (isHost && ep && ep->peers().empty() && now - lastAnnounce >= 1s) {
             lastAnnounce = now;
-            announce(signaling, localId, remoteId, localCandidate);
+            announce(signaling, localId, remoteId, localCandidates);
         }
 
         if (webrtcSession && webrtcSession->dc && webrtcSession->dc->isOpen() &&

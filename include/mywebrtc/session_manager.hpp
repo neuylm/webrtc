@@ -47,6 +47,8 @@ public:
     bool init(const std::string& signaling_url, const std::string& local_id,
               const std::string& auth_token);
 
+    void setIceServers(std::vector<std::string> urls);
+
     std::shared_ptr<Session> offer(const std::string& remote_id);
     std::shared_ptr<Session> answer(const std::string& remote_id,
                                     const std::string& remote_sdp);
@@ -71,6 +73,8 @@ private:
     std::string auth_token_;
     std::unordered_map<std::string, std::shared_ptr<Session>> sessions_;
     mutable std::mutex sessions_mtx_;
+    std::vector<std::string> ice_servers_;
+    mutable std::mutex ice_mtx_;
 
     TypedCallbackMap<void(const std::string&, SessionState)> state_cbs_;
     TypedCallbackMap<void(const std::string&, std::shared_ptr<DataChannel>)> dc_cbs_;

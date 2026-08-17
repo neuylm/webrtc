@@ -43,8 +43,15 @@ bool SessionManager::init(const std::string& signaling_url, const std::string& l
 
     // 信令服务器以 URL path 作为客户端 ID，如 ws://host:port/alice
     std::string url = signaling_url;
-    if (url.back() != '/') url += '/';
+    std::string query;
+    size_t mark = url.find('?');
+    if (mark != std::string::npos) {
+        query = url.substr(mark);
+        url.erase(mark);
+    }
+    if (url.empty() || url.back() != '/') url += '/';
     url += local_id;
+    url += query;
 
     if (!signaling_->connect(url)) return false;
 
@@ -117,9 +124,18 @@ void SessionManager::setupSignalingRouting() {
         }));
 }
 
+void SessionManager::setIceServers(std::vector<std::string> urls) {
+    std::lock_guard<std::mutex> lk(ice_mtx_);
+    ice_servers_ = std::move(urls);
+}
+
 std::shared_ptr<Session> SessionManager::createSession(const std::string& remote_id) {
     rtc::Configuration cfg;
-    cfg.iceServers.emplace_back("stun:stun.l.google.com:19302");
+    {
+        std::lock_guard<std::mutex> lk(ice_mtx_);
+        for (const auto& url : ice_servers_)
+            cfg.iceServers.emplace_back(url);
+    }
 
     auto s = std::make_shared<Session>();
     s->local_id = local_id_;
