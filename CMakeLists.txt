@@ -674,3 +674,7 @@ if(NOT NO_WEBSOCKET)
 endif()
 
 add_subdirectory(src/myrtm)
+
+if(NOT NO_WEBSOCKET AND NOT NO_EXAMPLES)
+	add_subdirectory(examples/rtm-session)
+endif()

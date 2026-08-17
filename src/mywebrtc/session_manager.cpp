@@ -3,15 +3,31 @@
  */
 #include "session_manager.hpp"
 
+#include <chrono>
 #include <stdexcept>
 
 namespace mywebrtc {
 
+namespace {
+
+constexpr int kOfferRetryMs = 1000;
+constexpr int kMaxOfferAttempts = 30;
+
+}
+
 SessionManager::SessionManager(std::shared_ptr<AuthPolicy> auth,
                                std::shared_ptr<SignalingChannel> signaling)
-    : auth_(std::move(auth)), signaling_(std::move(signaling)) {}
+    : auth_(std::move(auth)), signaling_(std::move(signaling)) {
+    retry_running_.store(true);
+    retry_thread_ = std::thread([this] { retryLoop(); });
+}
 
 SessionManager::~SessionManager() {
+    retry_running_.store(false);
+    retry_cv_.notify_all();
+    if (retry_thread_.joinable())
+        retry_thread_.join();
+
     std::lock_guard<std::mutex> lk(sessions_mtx_);
     for (auto& [id, s] : sessions_) {
         if (s && s->pc) s->pc->close();
@@ -34,6 +50,64 @@ bool SessionManager::init(const std::string& signaling_url, const std::string& l
 
     setupSignalingRouting();
     return true;
+}
+
+void SessionManager::retryLoop() {
+    while (retry_running_.load()) {
+        {
+            std::unique_lock<std::mutex> lk(retry_mtx_);
+            retry_cv_.wait_for(lk, std::chrono::milliseconds(kOfferRetryMs),
+                               [this] { return !retry_running_.load(); });
+        }
+        if (!retry_running_.load())
+            break;
+
+        std::vector<std::shared_ptr<Session>> live;
+        {
+            std::lock_guard<std::mutex> lk(sessions_mtx_);
+            for (auto& [id, s] : sessions_) {
+                if (s)
+                    live.push_back(s);
+            }
+        }
+
+        for (auto& s : live) {
+            SignalingMessage msg;
+            bool resend = false;
+            bool giveUp = false;
+            {
+                std::lock_guard<std::mutex> lk(s->offer_mtx);
+                if (!s->offering || s->answered || s->offer_sdp.empty())
+                    continue;
+                if (s->offer_attempts >= kMaxOfferAttempts) {
+                    giveUp = true;
+                } else {
+                    s->offer_attempts++;
+                    msg.peer_id = local_id_;
+                    msg.type = "offer";
+                    msg.description = s->offer_sdp;
+                    resend = true;
+                }
+            }
+            if (giveUp)
+                s->sm->fail();
+            else if (resend)
+                signaling_->send(s->remote_id, msg);
+        }
+    }
+}
+
+void SessionManager::flushCandidates(const std::shared_ptr<Session>& s) {
+    std::vector<SignalingMessage> held;
+    {
+        std::lock_guard<std::mutex> lk(s->offer_mtx);
+        if (s->answered)
+            return;
+        s->answered = true;
+        held.swap(s->held_candidates);
+    }
+    for (auto& msg : held)
+        signaling_->send(s->remote_id, msg);
 }
 
 void SessionManager::setupSignalingRouting() {
@@ -81,6 +155,11 @@ std::shared_ptr<Session> SessionManager::createSession(const std::string& remote
         msg.peer_id = sp->local_id_;
         msg.type = type;
         msg.description = sdp;
+        if (type == "offer") {
+            std::lock_guard<std::mutex> lk(s->offer_mtx);
+            s->offer_sdp = sdp;
+            s->offer_attempts = 1;
+        }
         sp->signaling_->send(s->remote_id, msg);
     }));
     s->subs.push_back(s->pc->onLocalCandidate([self = weak_from_this(), s](const std::string& cand,
@@ -92,6 +171,13 @@ std::shared_ptr<Session> SessionManager::createSession(const std::string& remote
         msg.type = "candidate";
         msg.candidate = cand;
         msg.mid = mid;
+        {
+            std::lock_guard<std::mutex> lk(s->offer_mtx);
+            if (s->offering && !s->answered) {
+                s->held_candidates.push_back(msg);
+                return;
+            }
+        }
         sp->signaling_->send(s->remote_id, msg);
     }));
 
@@ -115,6 +201,11 @@ std::shared_ptr<Session> SessionManager::offer(const std::string& remote_id) {
 
     auto s = createSession(remote_id);
     if (!s) return nullptr;
+
+    {
+        std::lock_guard<std::mutex> lk(s->offer_mtx);
+        s->offering = true;
+    }
 
     if (!s->sm->transition(SessionState::Offering)) return nullptr;
 
@@ -165,6 +256,7 @@ void SessionManager::handleSignalingMessage(const SignalingMessage& msg) {
         if (s) {
             s->sm->transition(SessionState::Connecting);
             s->pc->setRemoteDescription(msg.description.value_or(""), "answer");
+            flushCandidates(s);
         }
     } else if (msg.type == "candidate") {
         std::shared_ptr<Session> s;

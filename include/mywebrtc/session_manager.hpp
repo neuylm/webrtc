@@ -4,9 +4,13 @@
 #ifndef MYRTC_SESSION_MANAGER_H
 #define MYRTC_SESSION_MANAGER_H
 
+#include <atomic>
+#include <condition_variable>
 #include <memory>
 #include <string>
+#include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include "async.hpp"
 #include "callback_registry.hpp"
@@ -25,6 +29,13 @@ struct Session {
     std::shared_ptr<SessionStateMachine> sm;
     std::shared_ptr<DataChannel> dc;
     std::vector<Subscription> subs;  // 保持回调订阅存活
+
+    std::mutex offer_mtx;
+    std::string offer_sdp;
+    std::vector<SignalingMessage> held_candidates;
+    int offer_attempts = 0;
+    bool offering = false;
+    bool answered = false;
 };
 
 class SessionManager : public std::enable_shared_from_this<SessionManager> {
@@ -51,6 +62,8 @@ public:
 private:
     std::shared_ptr<Session> createSession(const std::string& remote_id);
     void setupSignalingRouting();
+    void retryLoop();
+    void flushCandidates(const std::shared_ptr<Session>& s);
 
     std::shared_ptr<AuthPolicy> auth_;
     std::shared_ptr<SignalingChannel> signaling_;
@@ -62,6 +75,11 @@ private:
     TypedCallbackMap<void(const std::string&, SessionState)> state_cbs_;
     TypedCallbackMap<void(const std::string&, std::shared_ptr<DataChannel>)> dc_cbs_;
     std::vector<Subscription> sig_subs_;
+
+    std::thread retry_thread_;
+    std::mutex retry_mtx_;
+    std::condition_variable retry_cv_;
+    std::atomic<bool> retry_running_{false};
 };
 
 } /* namespace mywebrtc */
