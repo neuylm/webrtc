@@ -672,3 +672,5 @@ install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/mywebrtc/
 if(NOT NO_WEBSOCKET)
 	add_subdirectory(examples/my-client)
 endif()
+
+add_subdirectory(src/myrtm)
