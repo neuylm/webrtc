@@ -458,6 +458,11 @@ void checkFrames() {
     maskInto(kOpClose, true, std::string(200, 'c'), fatClose);
     CHECK(readFrame(fatClose.data(), fatClose.size(), 4096, true, f, used) == FrameState::Bad);
 
+    std::vector<uint8_t> stumpyClose;
+    maskInto(kOpClose, true, std::string("\x03", 1), stumpyClose);
+    CHECK(readFrame(stumpyClose.data(), stumpyClose.size(), 4096, true, f, used) ==
+          FrameState::Bad);
+
     std::vector<uint8_t> bye;
     writeClose(1001, bye);
     CHECK(readFrame(bye.data(), bye.size(), 4096, false, f, used) == FrameState::Ok);
@@ -572,6 +577,66 @@ void checkRelay() {
 
     bob.shut();
     CHECK(waitFor([&] { return server->clients().size() == 1; }, 2000));
+    server->stop();
+}
+
+void checkFarewell() {
+    g_case = "farewell";
+
+    SignalConfig cfg;
+    auto server = spin(cfg);
+    CHECK(server != nullptr);
+    if (!server)
+        return;
+
+    Client bob;
+    CHECK(bob.shake(server->port(), "/bob"));
+
+    Wire oneShot;
+    CHECK(oneShot.dial(server->port()));
+
+    std::string head;
+    head += "GET /dave HTTP/1.1\r\n";
+    head += "Host: 127.0.0.1\r\n";
+    head += "Upgrade: websocket\r\n";
+    head += "Connection: Upgrade\r\n";
+    head += "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n";
+    head += "Sec-WebSocket-Version: 13\r\n";
+    head += "\r\n";
+
+    std::vector<uint8_t> burst(head.begin(), head.end());
+    maskInto(kOpText, true, R"({"id":"bob","type":"last words"})", burst);
+    CHECK(oneShot.put(burst));
+    oneShot.shut();
+
+    std::string got;
+    CHECK(bob.waitText(got, 2000));
+    CHECK(got == R"({"id":"dave","type":"last words"})");
+
+    Client alice;
+    CHECK(alice.shake(server->port(), "/alice"));
+    std::vector<uint8_t> bye;
+    maskInto(kOpClose, true, std::string("\x0b\xb9", 2), bye);
+    CHECK(alice.sendRaw(bye));
+
+    Frame echoed;
+    CHECK(alice.waitFrame(echoed, 1500));
+    CHECK(echoed.opcode == kOpClose);
+    CHECK(echoed.payload.size() == 2);
+    CHECK(uint16_t((uint16_t(echoed.payload[0]) << 8) | echoed.payload[1]) == 3001);
+
+    Client stub;
+    CHECK(stub.shake(server->port(), "/stub"));
+    std::vector<uint8_t> stumpy;
+    maskInto(kOpClose, true, std::string("\x03", 1), stumpy);
+    CHECK(stub.sendRaw(stumpy));
+
+    Frame protest;
+    CHECK(stub.waitFrame(protest, 1500));
+    CHECK(protest.opcode == kOpClose);
+    CHECK(protest.payload.size() == 2);
+    CHECK(uint16_t((uint16_t(protest.payload[0]) << 8) | protest.payload[1]) == 1002);
+
     server->stop();
 }
 
@@ -719,6 +784,39 @@ void checkDoor() {
     server->stop();
 }
 
+void checkHalfOpen() {
+    g_case = "half-open";
+
+    SignalConfig cfg;
+    auto server = spin(cfg);
+    CHECK(server != nullptr);
+    if (!server)
+        return;
+
+    std::vector<std::unique_ptr<Wire>> quiet;
+    for (int i = 0; i < 16; ++i) {
+        std::unique_ptr<Wire> w(new Wire());
+        CHECK(w->dial(server->port()));
+        quiet.push_back(std::move(w));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    CHECK(server->stats().rejected == 0);
+
+    Client crowded;
+    CHECK(!crowded.shake(server->port(), "/crowded"));
+    CHECK(waitFor([&] { return server->stats().rejected >= 1; }, 1000));
+
+    for (auto& w : quiet)
+        w->shut();
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    Client roomy;
+    CHECK(roomy.shake(server->port(), "/roomy"));
+    CHECK(waitFor([&] { return server->clients().size() == 1; }, 1000));
+
+    server->stop();
+}
+
 void checkTakeover() {
     g_case = "takeover";
 
@@ -788,6 +886,38 @@ void checkLimits() {
     CHECK(bob.waitFrame(closing, 1500));
     CHECK(closing.opcode == kOpClose);
     CHECK(waitFor([&] { return server->clients().size() == 1; }, 2000));
+
+    server->stop();
+}
+
+void checkTorrent() {
+    g_case = "torrent";
+
+    SignalConfig cfg;
+    auto server = spin(cfg);
+    CHECK(server != nullptr);
+    if (!server)
+        return;
+
+    Client alice;
+    Client bob;
+    CHECK(alice.shake(server->port(), "/alice"));
+    CHECK(bob.shake(server->port(), "/bob"));
+    CHECK(waitFor([&] { return server->clients().size() == 2; }, 1000));
+
+    bool allSent = true;
+    for (int i = 0; i < 1600; ++i)
+        allSent = alice.sendText(R"({"id":"bob","seq":)" + std::to_string(i) + "}") && allSent;
+    CHECK(allSent);
+
+    CHECK(waitFor([&] { return server->stats().relayed >= 1024; }, 4000));
+    CHECK(waitFor([&] { return server->stats().dropped > 0; }, 4000));
+    CHECK(server->stats().relayed + server->stats().dropped <= 1600);
+
+    std::string got;
+    CHECK(bob.waitText(got, 1000));
+    CHECK(got.find(R"({"id":"alice","seq":)") == 0);
+    CHECK(server->clients().size() == 2);
 
     server->stop();
 }
@@ -1021,12 +1151,15 @@ int main() {
     checkFrames();
     checkJson();
     checkRelay();
+    checkFarewell();
     checkMailbox();
     checkMailboxCap();
     checkExpiry();
     checkDoor();
+    checkHalfOpen();
     checkTakeover();
     checkLimits();
+    checkTorrent();
     checkHeartbeat();
     checkStun();
     checkStunV6();

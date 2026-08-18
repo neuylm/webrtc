@@ -65,6 +65,8 @@ FrameState readFrame(const uint8_t* p, size_t n, size_t limit, bool expectMask, 
 
     if (opcode >= kOpClose && (!fin || length > 125))
         return FrameState::Bad;
+    if (opcode == kOpClose && length == 1)
+        return FrameState::Bad;
     if (length > limit)
         return FrameState::Bad;
 

@@ -3,6 +3,7 @@
 #include "net.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -119,11 +120,6 @@ struct StunServer::Impl {
     mutable std::mutex mtx;
     StunStats shared;
 
-    void note(const std::string& line) {
-        if (cfg.log)
-            cfg.log(line);
-    }
-
     void run() {
         std::vector<uint8_t> buf(2048);
         std::vector<uint8_t> reply;
@@ -132,7 +128,11 @@ struct StunServer::Impl {
         while (running.load()) {
             Peer from;
             int n = sock.recv(buf.data(), buf.size(), from, 50);
-            if (n <= 0)
+            if (n < 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                continue;
+            }
+            if (n == 0)
                 continue;
 
             if (!looksLikeRequest(buf.data(), size_t(n))) {
@@ -142,7 +142,8 @@ struct StunServer::Impl {
                 if (buildSuccess(buf.data(), from, reply) &&
                     sock.send(reply.data(), reply.size(), from)) {
                     tally.responses++;
-                    note("told " + from.text() + " where it came from");
+                    if (cfg.log)
+                        cfg.log("told " + from.text() + " where it came from");
                 }
             }
 

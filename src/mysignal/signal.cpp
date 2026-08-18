@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -21,6 +22,9 @@ const size_t kHeadLimit = 8192;
 const size_t kOutLimit = 4 * 1024 * 1024;
 const size_t kMailboxCap = 256;
 const size_t kHeldBudget = 8 * 1024 * 1024;
+const size_t kPendingPerHost = 16;
+const size_t kRelayBurst = 1024;
+const size_t kRelayPerSecond = 256;
 const uint64_t kShakeTimeoutMs = 10000;
 const uint64_t kLingerMs = 2000;
 const int kPollWaitMs = 50;
@@ -38,12 +42,38 @@ SignalConfig sanitize(const SignalConfig& in) {
     return out;
 }
 
+std::string hostKey(const Peer& from) {
+    int family = 0;
+    uint8_t addr[16] = {0};
+    uint16_t port = 0;
+    if (!from.split(family, addr, port))
+        return std::string();
+
+    size_t width = family == AF_INET6 ? 16u : 4u;
+    return std::string(reinterpret_cast<const char*>(addr), width);
+}
+
+uint16_t farewell(const std::vector<uint8_t>& body) {
+    if (body.size() < 2)
+        return 1000;
+
+    uint16_t code = uint16_t((uint16_t(body[0]) << 8) | body[1]);
+    if (code == 1004 || code == 1005 || code == 1006 || code == 1015)
+        return 1002;
+    if (code >= 1000 && code <= 1014)
+        return code;
+    if (code >= 3000 && code <= 4999)
+        return code;
+    return 1002;
+}
+
 }
 
 struct SignalServer::Impl {
     struct Conn {
         Handle fd = kNoHandle;
         std::string who;
+        std::string host;
         std::string id;
         std::string in;
         std::vector<uint8_t> out;
@@ -54,6 +84,8 @@ struct SignalServer::Impl {
         bool closing = false;
         bool dying = false;
         bool pinged = false;
+        size_t credits = kRelayBurst;
+        uint64_t refilled = 0;
         uint64_t lastIn = 0;
         uint64_t closedAt = 0;
     };
@@ -73,6 +105,8 @@ struct SignalServer::Impl {
     std::unordered_map<std::string, std::deque<Pending>> mailbox;
     size_t heldBytes = 0;
     SignalStats tally;
+
+    bool rosterMoved = false;
 
     mutable std::mutex mtx;
     SignalStats shared;
@@ -105,6 +139,8 @@ struct SignalServer::Impl {
 
             size_t watched = slots.size() - 1;
             int ready = waitOn(slots.data(), slots.size(), kPollWaitMs);
+            if (ready < 0)
+                std::this_thread::sleep_for(std::chrono::milliseconds(kPollWaitMs));
             uint64_t now = nowMs();
 
             if (ready > 0) {
@@ -117,7 +153,7 @@ struct SignalServer::Impl {
                         c.dying = true;
                         continue;
                     }
-                    if (ev & POLLIN)
+                    if (ev & (POLLIN | POLLHUP))
                         feed(c, now);
                     if (!c.dying && (ev & POLLOUT))
                         drain(c);
@@ -148,21 +184,42 @@ struct SignalServer::Impl {
                 continue;
             }
 
+            std::string host = hostKey(from);
+            if (!host.empty() && waiting(host) >= kPendingPerHost) {
+                closeHandle(fd);
+                tally.rejected++;
+                note("refused a connection, too many half-open ones from that address");
+                continue;
+            }
+
             auto c = std::make_unique<Conn>();
             c->fd = fd;
-            c->who = from.text();
+            c->host = std::move(host);
+            if (cfg.log)
+                c->who = from.text();
             c->lastIn = now;
+            c->refilled = now;
             conns.push_back(std::move(c));
         }
     }
 
+    size_t waiting(const std::string& host) const {
+        size_t n = 0;
+        for (const auto& c : conns) {
+            if (!c->shook && !c->closing && !c->dying && c->host == host)
+                n++;
+        }
+        return n;
+    }
+
     void feed(Conn& c, uint64_t now) {
         uint8_t buf[8192];
+        bool gone = false;
         for (int loops = 0; loops < 8; ++loops) {
             int n = pullBytes(c.fd, buf, sizeof(buf));
             if (n < 0) {
-                c.dying = true;
-                return;
+                gone = true;
+                break;
             }
             if (n == 0)
                 break;
@@ -173,12 +230,15 @@ struct SignalServer::Impl {
 
         if (c.closing) {
             c.in.clear();
-            return;
+        } else {
+            if (!c.shook)
+                shakeHands(c, now);
+            if (c.shook && !c.closing)
+                chew(c, now);
         }
-        if (!c.shook)
-            shakeHands(c, now);
-        if (c.shook && !c.closing)
-            chew(c);
+
+        if (gone)
+            c.dying = true;
     }
 
     void shakeHands(Conn& c, uint64_t now) {
@@ -214,13 +274,27 @@ struct SignalServer::Impl {
             goodbye(*old->second, 1001, now);
         }
         byId[c.id] = &c;
+        rosterMoved = true;
         note("client " + c.id + " online from " + c.who);
 
         drain(c);
         deliver(c, now);
     }
 
-    void chew(Conn& c) {
+    bool sipCredit(Conn& c, uint64_t now) {
+        uint64_t gap = now - c.refilled;
+        size_t gain = size_t(gap * kRelayPerSecond / 1000);
+        if (gain > 0) {
+            c.credits = std::min(kRelayBurst, c.credits + gain);
+            c.refilled = now;
+        }
+        if (c.credits == 0)
+            return false;
+        c.credits--;
+        return true;
+    }
+
+    void chew(Conn& c, uint64_t now) {
         while (!c.dying && !c.closing) {
             Frame f;
             size_t used = 0;
@@ -245,7 +319,7 @@ struct SignalServer::Impl {
             if (f.opcode == kOpPong)
                 continue;
             if (f.opcode == kOpClose) {
-                quit(c, 1000);
+                quit(c, farewell(f.payload));
                 return;
             }
 
@@ -273,8 +347,12 @@ struct SignalServer::Impl {
                 continue;
 
             c.assembling = false;
-            if (c.msgOp == kOpText)
-                relay(c, std::string(c.msg.begin(), c.msg.end()));
+            if (c.msgOp == kOpText) {
+                if (sipCredit(c, now))
+                    relay(c, std::string(c.msg.begin(), c.msg.end()));
+                else
+                    tally.dropped++;
+            }
             c.msg.clear();
         }
     }
@@ -293,8 +371,10 @@ struct SignalServer::Impl {
 
         auto it = byId.find(dest);
         if (it != byId.end() && !it->second->dying && !it->second->closing) {
-            post(*it->second, rewritten);
-            tally.relayed++;
+            if (post(*it->second, rewritten))
+                tally.relayed++;
+            else
+                tally.dropped++;
             return;
         }
         stash(dest, rewritten);
@@ -349,20 +429,22 @@ struct SignalServer::Impl {
             }
             if (c.dying || c.closing)
                 continue;
-            post(c, held.text);
-            tally.flushed++;
+            if (post(c, held.text))
+                tally.flushed++;
+            else
+                tally.dropped++;
         }
         mailbox.erase(it);
     }
 
-    void post(Conn& c, const std::string& text) {
+    bool post(Conn& c, const std::string& text) {
         if (c.out.size() + text.size() + 16 > kOutLimit) {
-            note("client " + c.id + " is not draining, cutting it off");
-            quit(c, 1008);
-            return;
+            note("client " + c.id + " is not draining, dropping what it cannot take");
+            return false;
         }
         writeText(text, c.out);
         drain(c);
+        return true;
     }
 
     void drain(Conn& c) {
@@ -457,6 +539,7 @@ struct SignalServer::Impl {
             auto slot = byId.find(c->id);
             if (slot != byId.end() && slot->second == c) {
                 byId.erase(slot);
+                rosterMoved = true;
                 note("client " + c->id + " offline");
             }
             closeHandle(c->fd);
@@ -465,16 +548,18 @@ struct SignalServer::Impl {
     }
 
     void publish() {
-        std::vector<std::string> ids;
-        ids.reserve(byId.size());
-        for (auto& kv : byId)
-            ids.push_back(kv.first);
-        std::sort(ids.begin(), ids.end());
-
         std::lock_guard<std::mutex> lk(mtx);
         shared = tally;
-        shared.clients = ids.size();
-        roster = std::move(ids);
+        shared.clients = byId.size();
+        if (!rosterMoved)
+            return;
+
+        roster.clear();
+        roster.reserve(byId.size());
+        for (auto& kv : byId)
+            roster.push_back(kv.first);
+        std::sort(roster.begin(), roster.end());
+        rosterMoved = false;
     }
 
     void shutdown() {

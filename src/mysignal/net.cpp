@@ -38,6 +38,15 @@ bool wouldBlock() {
 #endif
 }
 
+bool discardable() {
+#ifdef _WIN32
+    int e = WSAGetLastError();
+    return e == WSAEMSGSIZE || e == WSAECONNRESET || e == WSAENETRESET;
+#else
+    return errno == ECONNREFUSED || errno == EMSGSIZE;
+#endif
+}
+
 bool alive(Handle h) {
 #ifdef _WIN32
     return h != INVALID_SOCKET;
@@ -315,13 +324,18 @@ int Datagram::recv(uint8_t* buf, size_t len, Peer& from, int timeoutMs) {
     slot.fd = fd_;
     slot.events = POLLIN;
 
-    if (waitOn(&slot, 1, timeoutMs) <= 0)
+    int ready = waitOn(&slot, 1, timeoutMs);
+    if (ready < 0)
+        return -1;
+    if (ready == 0)
         return 0;
 
     socklen_t fromLen = sizeof(from.sa);
     int n = static_cast<int>(recvfrom(fd_, reinterpret_cast<char*>(buf), static_cast<int>(len), 0,
                                       reinterpret_cast<sockaddr*>(&from.sa), &fromLen));
-    if (n <= 0)
+    if (n < 0)
+        return (wouldBlock() || discardable()) ? 0 : -1;
+    if (n == 0)
         return 0;
 
     from.len = static_cast<int>(fromLen);
