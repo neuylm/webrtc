@@ -672,3 +672,10 @@ install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/mywebrtc/
 if(NOT NO_WEBSOCKET)
 	add_subdirectory(examples/my-client)
 endif()
+
+add_subdirectory(src/myrtm)
+add_subdirectory(src/mysignal)
+
+if(NOT NO_WEBSOCKET AND NOT NO_EXAMPLES)
+	add_subdirectory(examples/rtm-session)
+endif()
