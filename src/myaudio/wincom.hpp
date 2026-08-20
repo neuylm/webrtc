@@ -1,0 +1,58 @@
+#ifndef MYAUDIO_WINCOM_H
+#define MYAUDIO_WINCOM_H
+
+#ifdef _WIN32
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+#include <windows.h>
+
+#include <audioclient.h>
+#include <mmdeviceapi.h>
+#include <propidl.h>
+
+#include <string>
+
+namespace myaudio {
+
+static const GUID kClsidEnumerator = {
+    0xbcde0395, 0xe52f, 0x467c, {0x8e, 0x3d, 0xc4, 0x57, 0x92, 0x91, 0x69, 0x2e}};
+static const GUID kIidEnumerator = {
+    0xa95664d2, 0x9614, 0x4f35, {0xa7, 0x46, 0xde, 0x8d, 0xb6, 0x36, 0x17, 0xe6}};
+static const GUID kIidAudioClient = {
+    0x1cb9ad4c, 0xdbfa, 0x4c32, {0xb1, 0x78, 0xc2, 0xf5, 0x68, 0xa7, 0x03, 0xb2}};
+static const GUID kIidRenderClient = {
+    0xf294acfc, 0x3146, 0x4483, {0xa7, 0xbf, 0xad, 0xdc, 0xa7, 0xc2, 0x60, 0xe2}};
+static const GUID kSubtypeFloat = {
+    0x00000003, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
+static const GUID kSubtypePcm = {
+    0x00000001, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
+
+static const PROPERTYKEY kPkeyFriendly = {
+    {0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}}, 14};
+
+std::string narrow(const wchar_t* text);
+std::wstring widen(const std::string& text);
+std::string friendlyName(IMMDevice* dev);
+std::string endpointId(IMMDevice* dev);
+bool looksLikeCable(const std::string& name);
+
+class ComGuard {
+public:
+    ComGuard();
+    ~ComGuard();
+
+private:
+    bool owned_ = false;
+};
+
+}
+
+#endif
+
+#endif
