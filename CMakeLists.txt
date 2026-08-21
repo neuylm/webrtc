@@ -675,6 +675,7 @@ endif()
 
 add_subdirectory(src/myrtm)
 add_subdirectory(src/mysignal)
+add_subdirectory(src/myaudio)
 
 if(NOT NO_WEBSOCKET AND NOT NO_EXAMPLES)
 	add_subdirectory(examples/rtm-session)
